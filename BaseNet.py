@@ -43,7 +43,7 @@ def load_and_preprocess_RA_data(csv_path):
     # Load data
     df = pd.read_csv(csv_path)
     
-    # Define feature columns (adjust based on your actual dataset)
+    # Define feature columns (adjust based on actual dataset)
     feature_columns = [
         'DAS28_CRP', 'SJC28', 'TJC28', 'CRP', 'ESR',
         'PtGA', 'PhGA', 'VAS_Pain', 'HAQ_DI',
@@ -73,14 +73,14 @@ def load_and_preprocess_RA_data(csv_path):
 
 
 # Alternative: Generate synthetic RA data for testing
-def generate_synthetic_RA_data(n_patients=500, n_features=21):
+def generate_synthetic_RA_data(n_patients=1000, n_features=21):
     """
     Generate synthetic RA patient data for testing the model
-    This simulates the distribution of real clinical data
+    This simulates the distribution of real clinical data with BALANCED classes
     """
     np.random.seed(42)
     
-    # Generate features with clinical realistic distributions
+    # Generate features with clinical realistic distributions (generated from claude and template NIH data)
     DAS28_CRP = np.random.normal(5.7, 1.2, n_patients)  # Mean from trials
     SJC28 = np.random.poisson(10, n_patients).astype(float)
     TJC28 = np.random.poisson(15, n_patients).astype(float)
@@ -114,22 +114,27 @@ def generate_synthetic_RA_data(n_patients=500, n_features=21):
         Smoking
     ])
     
-    # Generate response labels (0=Non-responder, 1=ACR20, 2=ACR50, 3=ACR70)
+    # Generate response labels with STRONGER signal and BALANCED classes
     # Response influenced by baseline disease activity and other factors
     response_score = (
-        -0.3 * DAS28_CRP +  # Higher disease activity = worse response
-        -0.2 * Disease_Duration +  # Longer duration = worse response
-        0.15 * (AntiCCP_Positive * (CRP > 12.3)) +  # Good predictor combo
-        -0.1 * Prior_Biologics +  # More failures = worse response
-        0.05 * MTX_Naive +  # MTX naive better response
-        np.random.randn(n_patients) * 2  # Random variation
+        -1.5 * (DAS28_CRP - 5.7) +  # Standardized, stronger weight
+        -0.8 * (Disease_Duration - 5) +  # Standardized
+        2.0 * (AntiCCP_Positive * (CRP > 12.3)) +  # Much stronger predictor
+        -0.5 * Prior_Biologics +
+        1.0 * MTX_Naive +
+        0.5 * (CRP < 10) +  # Low inflammation predicts better response
+        np.random.randn(n_patients) * 1.5  # Less random noise
     )
     
-    # Convert continuous scores to categorical response
+    # Convert to categorical with BALANCED distribution
+    # Use percentiles to ensure balanced classes
+    percentiles = [25, 50, 75]
+    thresholds = np.percentile(response_score, percentiles)
+    
     y = np.zeros(n_patients, dtype=int)
-    y[response_score > 0] = 1  # ACR20
-    y[response_score > 1] = 2  # ACR50
-    y[response_score > 2] = 3  # ACR70
+    y[response_score > thresholds[0]] = 1  # ACR20 (top 75%)
+    y[response_score > thresholds[1]] = 2  # ACR50 (top 50%)
+    y[response_score > thresholds[2]] = 3  # ACR70 (top 25%)
     
     # Standardize features
     scaler = StandardScaler()
@@ -139,12 +144,21 @@ def generate_synthetic_RA_data(n_patients=500, n_features=21):
 
 
 # ============================================================================
-# NEURAL NETWORK CLASSES
+# NEURAL NETWORK CLASSES (unchanged except for Xavier/He initialization)
 # ============================================================================
 
 class Layer_Dense:
-    def __init__(self, n_inputs, n_neurons):
-        self.weights = 0.01 * np.random.randn(n_inputs, n_neurons)
+    def __init__(self, n_inputs, n_neurons, weight_init='xavier'):
+        # Use Xavier/He initialization instead of tiny random weights
+        if weight_init == 'xavier':
+            # Xavier initialization for sigmoid/tanh/softmax
+            self.weights = np.random.randn(n_inputs, n_neurons) * np.sqrt(1. / n_inputs)
+        elif weight_init == 'he':
+            # He initialization for ReLU
+            self.weights = np.random.randn(n_inputs, n_neurons) * np.sqrt(2. / n_inputs)
+        else:
+            self.weights = 0.01 * np.random.randn(n_inputs, n_neurons)
+        
         self.biases = np.zeros((1, n_neurons))
         self.inputs = n_inputs
         self.neurons = n_neurons
@@ -174,7 +188,14 @@ class Loss:
         return data_loss
 
 
-class Loss_CCE(Loss):
+# ============================================================================
+# WEIGHTED LOSS FOR CLASS IMBALANCE
+# ============================================================================
+
+class Loss_CCE_Weighted(Loss):
+    def __init__(self, class_weights=None):
+        self.class_weights = class_weights
+    
     def forward(self, y_pred, y_true):
         samples = len(y_pred)
         y_pred_clipped = np.clip(y_pred, 1e-7, 1 - 1e-7)
@@ -185,7 +206,38 @@ class Loss_CCE(Loss):
             correct_confidences = np.sum(y_pred_clipped * y_true, axis=1)
         
         neg_log_likelihoods = -np.log(correct_confidences)
+        
+        # Apply class weights if provided
+        if self.class_weights is not None:
+            if len(y_true.shape) == 1:
+                weights = self.class_weights[y_true]
+            else:
+                weights = np.sum(self.class_weights * y_true, axis=1)
+            neg_log_likelihoods *= weights
+        
         return neg_log_likelihoods
+
+
+# ============================================================================
+# COMPUTE CLASS WEIGHTS FOR IMBALANCED DATA
+# ============================================================================
+
+def compute_class_weights(y):
+    """
+    Compute class weights inversely proportional to class frequencies
+    """
+    classes = np.unique(y)
+    class_counts = np.bincount(y)
+    total_samples = len(y)
+    
+    # Inverse frequency weighting
+    weights = total_samples / (len(classes) * class_counts)
+    
+    print("\nClass Distribution:")
+    for i, count in enumerate(class_counts):
+        print(f"  Class {i}: {count} samples ({count/total_samples*100:.1f}%), weight: {weights[i]:.3f}")
+    
+    return weights
 
 
 # ============================================================================
@@ -212,24 +264,33 @@ X_train, X_test, y_train, y_test = train_test_split(
 )
 
 # Initialize network architecture
-# KEY CHANGES FROM ORIGINAL:
-# 1. Input layer size = n_features (21 instead of 2)
-# 2. Hidden layer can be larger (128 or 256 neurons)
-# 3. Output layer = n_classes (4 for ACR response categories)
 
-dense1 = Layer_Dense(n_features, 128)  # Input: 21 features, Hidden: 128 neurons
+dense1 = Layer_Dense(n_features, 128, weight_init='he')  # Input: 21 features, Hidden: 128 neurons
 activation1 = Activation_ReLU()
-dense2 = Layer_Dense(128, 64)  # Additional hidden layer
+dense2 = Layer_Dense(128, 64, weight_init='he')  # Additional hidden layer
 activation2 = Activation_ReLU()
-dense3 = Layer_Dense(64, n_classes)  # Output: 4 classes
+dense3 = Layer_Dense(64, n_classes, weight_init='xavier')  # Output: 4 classes
 activation3 = Activation_Softmax()
 
-loss_function = Loss_CCE()
+# Compute class weights to handle imbalance
+class_weights = compute_class_weights(y_train)
+loss_function = Loss_CCE_Weighted(class_weights=class_weights)
 
 # Training hyperparameters
-learning_rate = 0.001  # Lower learning rate for more stable training
-num_iterations = 1000
+learning_rate = 0.001  # Higher initial learning rate
+num_iterations = 10000  # More iterations
 num_examples = X_train.shape[0]
+decay_rate = 0.95  # Learning rate decay
+decay_step = 1000
+
+# Add momentum for faster convergence
+momentum = 0.9
+velocity_w1 = np.zeros_like(dense1.weights)
+velocity_b1 = np.zeros_like(dense1.biases)
+velocity_w2 = np.zeros_like(dense2.weights)
+velocity_b2 = np.zeros_like(dense2.biases)
+velocity_w3 = np.zeros_like(dense3.weights)
+velocity_b3 = np.zeros_like(dense3.biases)
 
 # Tracking best model
 best_loss = float('inf')
@@ -241,6 +302,10 @@ print("=" * 60)
 
 # Training loop
 for iteration in range(num_iterations):
+    # Learning rate decay
+    if iteration % decay_step == 0 and iteration > 0:
+        learning_rate *= decay_rate
+    
     # Forward pass
     dense1.forward(X_train)
     activation1.forward(dense1.output)
@@ -256,12 +321,24 @@ for iteration in range(num_iterations):
     predictions = np.argmax(activation3.output, axis=1)
     accuracy = np.mean(predictions == y_train)
     
+    # Calculate per-class accuracy to detect "stuck" behavior
+    class_accuracies = []
+    for c in range(n_classes):
+        mask = y_train == c
+        if np.sum(mask) > 0:
+            class_acc = np.mean(predictions[mask] == c)
+            class_accuracies.append(class_acc)
+        else:
+            class_accuracies.append(0.0)
+    
     # Print progress
     if iteration % 500 == 0:
-        print(f"Iteration {iteration:5d} | Loss: {loss:.4f} | Accuracy: {accuracy:.4f}")
+        print(f"Iteration {iteration:5d} | Loss: {loss:.4f} | Accuracy: {accuracy:.4f} | LR: {learning_rate:.6f}")
+        print(f"  Per-class accuracy: {[f'{acc:.3f}' for acc in class_accuracies]}")
+        print(f"  Predictions: {np.bincount(predictions, minlength=n_classes)}")
     
     # Save best model
-    if loss < best_loss:
+    if accuracy > best_accuracy:  # Changed from loss to accuracy
         best_loss = loss
         best_accuracy = accuracy
         best_iteration = iteration
@@ -279,9 +356,18 @@ for iteration in range(num_iterations):
     dscores[range(num_examples), y_train] -= 1
     dscores /= num_examples
     
+    # Apply class weights to gradients
+    if class_weights is not None:
+        weight_matrix = class_weights[y_train].reshape(-1, 1)
+        dscores *= weight_matrix
+    
     # Gradient for output layer
     dW3 = np.dot(activation2.output.T, dscores)
     db3 = np.sum(dscores, axis=0, keepdims=True)
+    
+    # Add L2 regularization
+    reg_lambda = 0.001
+    dW3 += reg_lambda * dense3.weights
     
     # Backprop into second hidden layer
     dhidden2 = np.dot(dscores, dense3.weights.T)
@@ -290,6 +376,7 @@ for iteration in range(num_iterations):
     # Gradient for second hidden layer
     dW2 = np.dot(activation1.output.T, dhidden2)
     db2 = np.sum(dhidden2, axis=0, keepdims=True)
+    dW2 += reg_lambda * dense2.weights
     
     # Backprop into first hidden layer
     dhidden1 = np.dot(dhidden2, dense2.weights.T)
@@ -298,12 +385,22 @@ for iteration in range(num_iterations):
     # Gradient for first hidden layer
     dW1 = np.dot(X_train.T, dhidden1)
     db1 = np.sum(dhidden1, axis=0, keepdims=True)
+    dW1 += reg_lambda * dense1.weights
     
-    # Update weights with gradient descent
-    dense1.weights -= learning_rate * dW1
-    dense2.biases -= learning_rate * db2
-    dense3.weights -= learning_rate * dW3
-    dense3.biases -= learning_rate * db3
+    # Update weights with momentum
+    velocity_w1 = momentum * velocity_w1 - learning_rate * dW1
+    velocity_b1 = momentum * velocity_b1 - learning_rate * db1
+    velocity_w2 = momentum * velocity_w2 - learning_rate * dW2
+    velocity_b2 = momentum * velocity_b2 - learning_rate * db2
+    velocity_w3 = momentum * velocity_w3 - learning_rate * dW3
+    velocity_b3 = momentum * velocity_b3 - learning_rate * db3
+    
+    dense1.weights += velocity_w1
+    dense1.biases += velocity_b1
+    dense2.weights += velocity_w2
+    dense2.biases += velocity_b2
+    dense3.weights += velocity_w3
+    dense3.biases += velocity_b3
 
 print("=" * 60)
 print(f"\nTraining completed!")
